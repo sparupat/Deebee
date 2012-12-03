@@ -8,7 +8,7 @@
 //
 //  github.com/flvgello/deebee
 //
-//  Optimised for DropboxSDK 1.1
+//  Tested successfully with DropboxSDK 1.3
 //
 
 #import <QuartzCore/QuartzCore.h>
