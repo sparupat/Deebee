@@ -710,18 +710,19 @@
             [remoteFolders setObject:item.lastModifiedDate forKey:item.path];
             [remoteFoldersRevs setObject:item.rev forKey:item.path];
         } else {
-            if (!_escapeRootFiles){
-                if (_syncImagesOnly){
-                    NSString *extension = [[item.path pathExtension] lowercaseString];
-                    if ([validExtensions indexOfObject:extension] != NSNotFound){
-                        [remoteFiles setObject:item.lastModifiedDate forKey:item.path];
-                        [remoteFilesRevs setObject:item.rev forKey:item.path];
-                    }
-                } else {
+            if ([remotePath isEqualToString:@"/"] && _escapeRootFiles)
+                continue;
+                
+            if (_syncImagesOnly){
+                NSString *extension = [[item.path pathExtension] lowercaseString];
+                if ([validExtensions indexOfObject:extension] != NSNotFound){
                     [remoteFiles setObject:item.lastModifiedDate forKey:item.path];
                     [remoteFilesRevs setObject:item.rev forKey:item.path];
-                    [remoteFilesThumbnails setObject:[NSNumber numberWithBool:item.thumbnailExists] forKey:item.path];
                 }
+            } else {
+                [remoteFiles setObject:item.lastModifiedDate forKey:item.path];
+                [remoteFilesRevs setObject:item.rev forKey:item.path];
+                [remoteFilesThumbnails setObject:[NSNumber numberWithBool:item.thumbnailExists] forKey:item.path];
             }
         }
     }
