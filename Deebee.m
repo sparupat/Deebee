@@ -14,10 +14,11 @@
 // ----------------------------------------------------------------------------------------------------------
 // TO DO
 // ----------------------------------------------------------------------------------------------------------
-// - IF lastAbstractLocalItems has items, AND currentAbstractLocalItems has no item?
-// - IF lastAbstractLocalItems has items, AND currentAbstractLocalItems has no item OR Dropbox has no item?
 // - Implement a better way to handle sync errors. At the moment, if any error, sync never ends.
 //   both for progress and sync itself.
+// - Better progress.
+// - IF lastAbstractLocalItems has items, AND currentAbstractLocalItems has no item?
+// - IF lastAbstractLocalItems has items, AND currentAbstractLocalItems has no item OR Dropbox has no item?
 // ----------------------------------------------------------------------------------------------------------
 
 #import <QuartzCore/QuartzCore.h>
@@ -722,11 +723,16 @@
     if (itemsToSync == 0){
         // Since we put files in folders, they'll have a different lastModified date.
         // Hence, update with the ones on Dropbox.
-        for (DeebeeItem *item in foldersToUpdateLocally){
-            NSError *error = nil;
-            NSDictionary *attr = [NSDictionary dictionaryWithObject:item.lastModified forKey:NSFileModificationDate];
-            if (![[NSFileManager defaultManager] setAttributes:attr ofItemAtPath:item.localPath error:&error])
-                NSLog(@"ERROR — Modifying Folder's Modification Date: %@, %@", error, [error userInfo]);
+        if ([foldersToUpdateLocally count] > 0){
+            for (DeebeeItem *item in foldersToUpdateLocally){
+                NSError *error = nil;
+                NSDictionary *attr = [NSDictionary dictionaryWithObject:item.lastModified forKey:NSFileModificationDate];
+                if (![[NSFileManager defaultManager] setAttributes:attr ofItemAtPath:item.localPath error:&error]){
+                    NSLog(@"ERROR — Modifying Folder's Modification Date: %@, %@", error, [error userInfo]);
+                } else {
+                    [foldersToUpdateLocally removeObject:item];
+                }
+            }
         }
         
         isMetadataComplete = YES;
