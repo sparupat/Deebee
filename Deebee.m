@@ -1,40 +1,30 @@
 //
 //  Deebee.m
-//  v 1.0
+//  v 0.3 ß
 //
-//  Created by Will Flagello, licensed with Evey License.
+//  Created by Will Flagello. MIT License.
 //  ----------------------------------------------------------------------------------------------------
 //  Special thanks to Chris Hulbert and his CHBgDropboxSync.
 //
 //  github.com/flvgello/deebee
 //
-//  Tested with Dropbox 1.3
+//  For Dropbox iOS SDK 1.3
 //
 
-// ----------------------------------------------------------------------------
+// ----------------------------------------------------------------------------------------------------------
 // TO DO
-// ----------------------------------------------------------------------------
-// -
-// ----------------------------------------------------------------------------
-// CHANGES
-// ----------------------------------------------------------------------------
-// Move download, upload, delete et al in a method that has a similar behaviour of the one in CHBg…
-// Why checking for metadata without syncing?
-// Hence, check for metadata AND sync just after.
-// The basic implementation remains the same, because loadMetadata has some good processes to look for
-// changes et al. What needs to be changed is the way we sync things.
-// In the download/upload/delete callbacks we do what's being done now, and then we
-// laod another method that process only and solely the next thing. Given that we remove things from
-// the original arrays, we don't need to do anything else but load the objects stored in NSUserDefaults
-// every single time.
-// This way we'll also have a better way to calculate progress.
-// ----------------------------------------------------------------------------
+// ----------------------------------------------------------------------------------------------------------
+// - IF lastAbstractLocalItems has items, AND currentAbstractLocalItems has no item?
+// - IF lastAbstractLocalItems has items, AND currentAbstractLocalItems has no item OR Dropbox has no item?
+// - Implement a better way to handle sync errors. At the moment, if any error, sync never ends.
+//   both for progress and sync itself.
+// ----------------------------------------------------------------------------------------------------------
 
 #import <QuartzCore/QuartzCore.h>
 #import "Deebee.h"
-#import "NSTimer+Blocks.h"
 
 #define DeebeeIsFirstSync                 @"DeebeeIsFirstSync"
+#define DeebeeRemoteFoldersToSync         @"DeebeeRemoteFoldersToSync"
 #define DeebeeRemoteItemsToDownload       @"DeebeeRemoteItemsToDownload"
 #define DeebeeRemoteItemsToDelete         @"DeebeeRemoteItemsToDelete"
 #define DeebeeLocalItemsToUpload          @"DeebeeLocalItemsToUpload"
@@ -50,9 +40,10 @@
     BOOL                    isFirstSync;
     BOOL                    isMetadataComplete;
     BOOL                    isSyncComplete;
+    int                     itemsToSync;
+    NSMutableArray          *foldersToUpdateLocally;
     NSArray                 *validImageExtensions;
-    NSOperationQueue        *operationsQueue;
-    DBRestClient            *client;
+    DBRestClient            *DBClient;
 }
 
 @end
@@ -79,6 +70,7 @@
 
 - (void)initDefaults
 {
+    [[NSUserDefaults standardUserDefaults] setObject:[NSKeyedArchiver archivedDataWithRootObject:[NSArray array]] forKey:DeebeeRemoteFoldersToSync];
     [[NSUserDefaults standardUserDefaults] setObject:[NSKeyedArchiver archivedDataWithRootObject:[NSArray array]] forKey:DeebeeRemoteItemsToDownload];
     [[NSUserDefaults standardUserDefaults] setObject:[NSKeyedArchiver archivedDataWithRootObject:[NSArray array]] forKey:DeebeeRemoteItemsToDelete];
     [[NSUserDefaults standardUserDefaults] setObject:[NSKeyedArchiver archivedDataWithRootObject:[NSArray array]] forKey:DeebeeLocalItemsToUpload];
@@ -90,7 +82,8 @@
 }
 
 - (void)eraseDefaults
-{    
+{
+    [[NSUserDefaults standardUserDefaults] removeObjectForKey:DeebeeRemoteFoldersToSync];
     [[NSUserDefaults standardUserDefaults] removeObjectForKey:DeebeeRemoteItemsToDownload];
     [[NSUserDefaults standardUserDefaults] removeObjectForKey:DeebeeRemoteItemsToDelete];
     [[NSUserDefaults standardUserDefaults] removeObjectForKey:DeebeeLocalItemsToUpload];
@@ -103,16 +96,13 @@
 
 - (void)initDeebee
 {
-    if (client) return;
+    if (DBClient) return;
     
-    client = [[DBRestClient alloc] initWithSession:[DBSession sharedSession]];
-    client.delegate = self;
+    DBClient = [[DBRestClient alloc] initWithSession:[DBSession sharedSession]];
+    DBClient.delegate = self;
     
     isMetadataComplete = YES;
     isSyncComplete = YES;
-    
-    operationsQueue = [NSOperationQueue mainQueue];
-    operationsQueue.maxConcurrentOperationCount = 2;
     
     if ([_localRootPath length] == 0) isDefaultLocalRootPath = YES;
     if ([_remoteRootPath length] == 0) isDefaultRemoteRootPath = YES;
@@ -128,6 +118,7 @@
     NSLog(@"Remote Root Path —— %@", _remoteRootPath);
     NSLog(@"Default Root Path? —— %i", isDefaultLocalRootPath);
     NSLog(@"Default Remote Path? —— %i", isDefaultRemoteRootPath);
+    NSLog(@"Sync First Level Only? —— %i", _syncFirstLevelOnly);
     NSLog(@"Sync Files Only? —— %i", _syncFilesOnly);
     NSLog(@"Sync Images Only? —— %i", _syncImagesOnly);
     NSLog(@"Sync Thumbnails Only? —— %i", _syncThumbnailsOnly);
@@ -136,7 +127,7 @@
     NSLog(@"Syncable File Extensions: %@", _syncableFileExtensions);
    
     [self.delegate didStartLoadingMetadata];
-    [client loadMetadata:_remoteRootPath];
+    [DBClient loadMetadata:_remoteRootPath];
 }
 
 
@@ -185,11 +176,11 @@
 
 - (void)releaseClient
 {
-    __autoreleasing DBRestClient* autoreleaseClient = client;
+    __autoreleasing DBRestClient *autoreleaseClient = DBClient;
     [autoreleaseClient description];
     
-    client.delegate = nil;
-    client = nil;
+    DBClient.delegate = nil;
+    DBClient = nil;
 }
 
 
@@ -198,15 +189,15 @@
 #pragma mark Out of the (Drop)box callbacks
 #pragma mark ----------------------------------------------------------------------------------------------
 
-- (void)restClient:(DBRestClient *)restClient loadedMetadata:(DBMetadata *)metadata
+- (void)restClient:(DBRestClient *)client loadedMetadata:(DBMetadata *)metadata
 {
-    if (!isSyncComplete) return;
-    if (!isMetadataComplete) return;
+    if (!isSyncComplete || !isMetadataComplete) return;
     
     isMetadataComplete = NO;
     NSString *remotePath = metadata.path;
     NSLog(@"Current Metadata: %@", remotePath);
     
+    foldersToUpdateLocally = [NSMutableArray array];
     NSMutableArray *folders = [NSMutableArray array];
     NSMutableArray *files = [NSMutableArray array];
     
@@ -215,32 +206,13 @@
             if (_syncFilesOnly)
                 continue;
             
+            if (_syncFirstLevelOnly)
+                if (![remotePath isEqualToString:@"/"])
+                    continue;
+            
             NSMutableString *localPath = [NSMutableString stringWithString:[NSString stringWithFormat:@"%@%@", [self localRootDirectory], item.path]];
             DeebeeItem *folder = [DeebeeItem initFromMetadata:item withLocalPath:localPath];
             [folders addObject:folder];
-            
-            // IT HAS TO BE REWRITTEN WITH LOAD METADATA.
-            if ([remotePath isEqualToString:@"/"]){
-                NSLog(@"We are going through.");
-                for (DBMetadata *itemInFolder in item.contents){
-                    NSLog(@"item.contents: %@", item.contents);
-                    if (itemInFolder.isDirectory)
-                        continue;
-                    
-                    NSString *extension = [[itemInFolder.path pathExtension] lowercaseString];
-                    
-                    if (_syncImagesOnly)
-                        if ([validImageExtensions indexOfObject:extension] == NSNotFound)
-                            continue;
-                    
-                    if (_syncableFileExtensions)
-                        if ([_syncableFileExtensions indexOfObject:extension] == NSNotFound)
-                            continue;
-                    
-                    DeebeeItem *file = [DeebeeItem initFromMetadata:itemInFolder withLocalPath:localPath];
-                    [files addObject:file];
-                }
-            }
         } else {
             if (_escapeRootFiles && [remotePath isEqualToString:@"/"])
                 continue;
@@ -260,9 +232,7 @@
             [files addObject:file];
         }
     }
-    
-    
-    
+        
     NSArray *previousRemoteItemsToDownload = [NSKeyedUnarchiver unarchiveObjectWithData:[[NSUserDefaults standardUserDefaults] objectForKey:DeebeeRemoteItemsToDownload]];
     NSArray *previousLocalItemsToUpload = [NSKeyedUnarchiver unarchiveObjectWithData:[[NSUserDefaults standardUserDefaults] objectForKey:DeebeeLocalItemsToUpload]];
     NSArray *previousLocalItemsToDelete = [NSKeyedUnarchiver unarchiveObjectWithData:[[NSUserDefaults standardUserDefaults] objectForKey:DeebeeLocalItemsToDelete]];
@@ -272,11 +242,13 @@
     NSMutableArray *remoteItemsToDelete = [NSMutableArray array];
     NSMutableArray *localItemsToUpload = [NSMutableArray array];
     NSMutableArray *localItemsToDelete = [NSMutableArray array];
-    
+        
+    [folders addObjectsFromArray:[NSKeyedUnarchiver unarchiveObjectWithData:[[NSUserDefaults standardUserDefaults] objectForKey:DeebeeRemoteFoldersToSync]]];
+    [[NSUserDefaults standardUserDefaults] setObject:[NSKeyedArchiver archivedDataWithRootObject:folders] forKey:DeebeeRemoteFoldersToSync];
     [[NSUserDefaults standardUserDefaults] setObject:[NSKeyedArchiver archivedDataWithRootObject:[self getCurrentAbstractLocalItems]]
                                               forKey:DeebeeCurrentAbstractLocalItems];
     [[NSUserDefaults standardUserDefaults] synchronize];
-    
+        
     NSArray *lastAbstractLocalItems = [NSKeyedUnarchiver unarchiveObjectWithData:[[NSUserDefaults standardUserDefaults] objectForKey:DeebeeLastAbstractLocalItems]];
     NSArray *currentAbstractLocalItems = [NSKeyedUnarchiver unarchiveObjectWithData:[[NSUserDefaults standardUserDefaults] objectForKey:DeebeeCurrentAbstractLocalItems]];
 
@@ -306,14 +278,18 @@
                     }
                     
                     if (currentItem.lastModified.timeIntervalSinceReferenceDate > lastItem.lastModified.timeIntervalSinceReferenceDate){
-                        [localItemsToUpload addObject:currentItem];
-                        continue;
+                        if (!currentItem.isDirectory){
+                            [localItemsToUpload addObject:currentItem];
+                            continue;
+                        }
                     }
                 }
                 
                 if (![lastAbstractLocalItems containsObject:currentItem]){
-                    [localItemsToUpload addObject:currentItem];
-                    continue;
+                    if (!currentItem.isDirectory){
+                        [localItemsToUpload addObject:currentItem];
+                        continue;
+                    }
                 }
             }
             
@@ -434,6 +410,11 @@
     [[NSUserDefaults standardUserDefaults] setObject:[NSKeyedArchiver archivedDataWithRootObject:remoteItemsToDownload] forKey:DeebeeRemoteItemsToDownload];
     [[NSUserDefaults standardUserDefaults] synchronize];
     
+    // Local Folders to update later.
+    for (DeebeeItem *item in remoteItemsToDownload)
+        if (item.isDirectory)
+            [foldersToUpdateLocally addObject:item];
+    
     // A check to see if there's nothing to sync.
     if ([localItemsToDelete count] == 0 && [localItemsToUpload count] == 0 && [remoteItemsToDelete count] == 0 && [remoteItemsToDownload count] == 0){
         NSLog(@"Nothing to sync.");
@@ -449,32 +430,21 @@
     
     int remainingItemsToSync = [localItemsToDelete count] + [localItemsToUpload count] + [remoteItemsToDelete count] + [remoteItemsToDownload count];
     if (isFirstSync) remainingItemsToSync = [remoteItemsToDownload count];
+    itemsToSync = remainingItemsToSync;
     
-    [self.delegate didLoadMetadataWithItemsToSync:remainingItemsToSync];
+    [self.delegate didLoadMetadataWithItemsToSync:itemsToSync];
     
-    if (isFirstSync){
-        BOOL isFirstSyncCompleted = [self performInitSyncWithItems:remoteItemsToDownload];
-        
-        if (isFirstSyncCompleted){
-            isMetadataComplete = YES;
-            isFirstSync = NO;
-            [[NSUserDefaults standardUserDefaults] setBool:isFirstSync forKey:DeebeeIsFirstSync];
-            [[NSUserDefaults standardUserDefaults] synchronize];
-            return;
-        }
-    } else {
-        isMetadataComplete = YES;
-        return;
-    }
+    [self.delegate didStartSyncing];
+    [self performSyncOperations];
 }
 
-- (void)restClient:(DBRestClient*)client metadataUnchangedAtPath:(NSString*)path
+- (void)restClient:(DBRestClient *)client metadataUnchangedAtPath:(NSString *)path
 {
     NSLog(@"Metadata Unchanged At Path: %@", path);
     [self endWithHappiness];
 }
 
-- (void)restClient:(DBRestClient*)client loadMetadataFailedWithError:(NSError*)error
+- (void)restClient:(DBRestClient *)client loadMetadataFailedWithError:(NSError *)error
 {
     [self.delegate didLoadMetadataFailWithError:error];
     NSLog(@"ERROR — Load Metadata Failed With Error: %@, %@", error, [error userInfo]);
@@ -494,7 +464,7 @@
     NSDictionary *attr = [NSDictionary dictionaryWithObject:metadata.lastModifiedDate forKey:NSFileModificationDate];
     if (![[NSFileManager defaultManager] setAttributes:attr ofItemAtPath:srcPath error:&error])
         NSLog(@"ERROR — Modifying File's Modification Date After Upload: %@, %@", error, [error userInfo]);
-    
+        
     // Let's remove the uploaded item from DeebeeLocalItemsToUpload
     NSMutableString *localPath = [NSMutableString stringWithString:[NSString stringWithFormat:@"%@%@", [self localRootDirectory], metadata.path]];
     DeebeeItem *item = [DeebeeItem initFromMetadata:metadata withLocalPath:localPath];
@@ -507,6 +477,11 @@
     } else {
         NSLog(@"ERROR — Removing Object from DeebeeLocalItemsToUpload");
     }
+    
+    itemsToSync--;
+    [self.delegate didChangeSyncingWithItemsToSync:itemsToSync];
+    
+    [self performSyncOperations];
 }
 
 - (void)restClient:(DBRestClient *)client uploadFileFailedWithError:(NSError *)error
@@ -542,6 +517,11 @@
     } else {
         NSLog(@"ERROR — Removing Object from DeebeeRemoteItemsToDownload");
     }
+    
+    itemsToSync--;
+    [self.delegate didChangeSyncingWithItemsToSync:itemsToSync];
+    
+    [self performSyncOperations];
 }
 
 - (void)restClient:(DBRestClient *)client loadFileFailedWithError:(NSError *)error
@@ -573,6 +553,11 @@
     } else {
         NSLog(@"ERROR — Removing Object from DeebeeRemoteItemsToDownload");
     }
+    
+    itemsToSync--;
+    [self.delegate didChangeSyncingWithItemsToSync:itemsToSync];
+    
+    [self performSyncOperations];
 }
 
 - (void)restClient:(DBRestClient *)client loadThumbnailFailedWithError:(NSError *)error
@@ -603,6 +588,11 @@
     } else {
         NSLog(@"ERROR — Removing Object from DeebeeRemoteItemsToDelete");
     }
+    
+    itemsToSync--;
+    [self.delegate didChangeSyncingWithItemsToSync:itemsToSync];
+    
+    [self performSyncOperations];
 }
 
 - (void)restClient:(DBRestClient *)client deletePathFailedWithError:(NSError *)error
@@ -615,111 +605,170 @@
 
 
 #pragma mark ----------------------------------------------------------------------------------------------
-#pragma mark Virgin Sync (Or: There's a First Time for Everyone)
+#pragma mark Sync Ops, AKA: Tomorrow Never Dies — & Virgin Sync (or: There's a First Time for Everything)
 #pragma mark ----------------------------------------------------------------------------------------------
 
-- (BOOL)performInitSyncWithItems:(NSArray *)remoteItemsToDownload
-{
-    if (!isFirstSync) return YES;
-    
-    isSyncComplete = NO;
-    [self.delegate didStartSyncing];
-    
-    int initialNumberOfRemoteItemsToDownload = [remoteItemsToDownload count];
+- (void)performSyncOperations
+{    
     NSMutableArray *folders = [NSMutableArray array];
-    NSMutableArray *files = [NSMutableArray array];
+    NSMutableArray *deletedLocalItems = [NSMutableArray array];
+    NSMutableArray *localItemsToDelete = [NSMutableArray arrayWithArray:[NSKeyedUnarchiver unarchiveObjectWithData:[[NSUserDefaults standardUserDefaults] objectForKey:DeebeeLocalItemsToDelete]]];
+    NSMutableArray *localItemsToUpload = [NSMutableArray arrayWithArray:[NSKeyedUnarchiver unarchiveObjectWithData:[[NSUserDefaults standardUserDefaults] objectForKey:DeebeeLocalItemsToUpload]]];
+    NSArray *remoteItemsToDelete = [NSKeyedUnarchiver unarchiveObjectWithData:[[NSUserDefaults standardUserDefaults] objectForKey:DeebeeRemoteItemsToDelete]];
+    NSMutableArray *remoteItemsToDownload = [NSMutableArray arrayWithArray:[NSKeyedUnarchiver unarchiveObjectWithData:[[NSUserDefaults standardUserDefaults] objectForKey:DeebeeRemoteItemsToDownload]]];
     
-    for (DeebeeItem *item in remoteItemsToDownload){
-        if (item.isDirectory){
-            [folders addObject:item];
-        } else {
-            [files addObject:item];
+    int numberOfLocalItemsToDelete = [localItemsToDelete count];
+    int numberOfLocalItemsToUpload = [localItemsToUpload count];
+    int numberOfRemoteItemsToDelete = [remoteItemsToDelete count];
+    int numberOfRemoteItemsToDownload = [remoteItemsToDownload count];
+    
+    // We'll need to update NSUserDefaults with the synced items. All the other arrays will be treated
+    // with methods that have a Dropbox callback. In this way, if an item is successfully synced, we
+    // delete it from its array in NSUserDefaults. If not, and hence we got an error, we do nothing
+    // so that we can sync it later, in the next call.
+    // But… localItemsToDelete doesn't use a Dropbox method since it removes items locally.
+    // Therefore we need to work on another solution, that is exploiting the NSError:
+    // if error, do nothing, we retry later; if successfully deleted, we remove the item from the array.
+    
+    if (!isFirstSync){
+        if (numberOfLocalItemsToDelete > 0){
+            for (DeebeeItem *item in localItemsToDelete){
+                NSError *error = nil;
+                NSLog(@"Deleting Local Item: %@", item.path);
+                if(![[NSFileManager defaultManager] removeItemAtPath:item.localPath error:&error]){
+                    if ([self.delegate respondsToSelector:@selector(localItemDeleteFailedWithError:)])
+                        [self.delegate localItemDeleteFailedWithError:error];
+                    NSLog(@"ERROR — Deleting Local Item: %@, %@", error, [error userInfo]);
+                    // We got an error, the item couldn't be deleted either because it's not there
+                    // or because there was another kind of error.
+                    // We do nothing, leave the record in the array, and try to repeat the operation in the next sync.
+                } else {
+                    if ([[NSKeyedUnarchiver unarchiveObjectWithData:[[NSUserDefaults standardUserDefaults] objectForKey:DeebeeLocalItemsToDelete]] containsObject:item])
+                        [deletedLocalItems addObject:item];
+                    // If the item was successfully deleted, we add it to the array that contains the deleted items
+                    // so that we can remove them all later from the original array, localItemsToDelete.
+                    
+                    itemsToSync--;
+                    [self.delegate didChangeSyncingWithItemsToSync:itemsToSync];
+                }
+            }
+            
+            [localItemsToDelete removeObjectsInArray:deletedLocalItems];
+            [[NSUserDefaults standardUserDefaults] setObject:[NSKeyedArchiver archivedDataWithRootObject:localItemsToDelete] forKey:DeebeeLocalItemsToDelete];
+            [[NSUserDefaults standardUserDefaults] synchronize];
+        }
+        
+        if (numberOfLocalItemsToUpload > 0){
+            DeebeeItem *nextItemToUpload = [localItemsToUpload objectAtIndex:0];
+            NSLog(@"Uploading File: %@", nextItemToUpload.path);
+            [DBClient uploadFile:[NSMutableString stringWithString:nextItemToUpload.name]
+                          toPath:[NSMutableString stringWithString:[nextItemToUpload.path stringByDeletingLastPathComponent]]
+                   withParentRev:nil
+                        fromPath:[NSMutableString stringWithString:nextItemToUpload.localPath]];
+            return;
+        }
+        
+        if (numberOfRemoteItemsToDelete > 0){
+            DeebeeItem *nextItemToDelete = [remoteItemsToDelete objectAtIndex:0];
+            NSLog(@"Deleting Remote Item: %@", nextItemToDelete.path);
+            [DBClient deletePath:nextItemToDelete.path];
+            return;
+        }
+    }
+       
+    if (numberOfRemoteItemsToDownload > 0){
+        DeebeeItem *nextItemToDownload = [remoteItemsToDownload objectAtIndex:0];
+        while (nextItemToDownload.isDirectory){
+            [folders addObject:nextItemToDownload];
+            [remoteItemsToDownload removeObject:nextItemToDownload];
+            [[NSUserDefaults standardUserDefaults] setObject:[NSKeyedArchiver archivedDataWithRootObject:remoteItemsToDownload] forKey:DeebeeRemoteItemsToDownload];
+            [[NSUserDefaults standardUserDefaults] synchronize];
+            
+            // TO DO - Think about a better way to handle errors.
+            NSLog(@"Creating Folder at Path: %@", nextItemToDownload.localPath);
+            NSError *error = nil;
+            NSDictionary *attr = [NSDictionary dictionaryWithObject:nextItemToDownload.lastModified forKey:NSFileModificationDate];
+            if(![[NSFileManager defaultManager] createDirectoryAtPath:[NSMutableString stringWithString:nextItemToDownload.localPath]
+                                          withIntermediateDirectories:NO attributes:attr error:&error]){
+                NSLog(@"ERROR — Creating Folder: %@, %@", error, [error userInfo]);
+            } else {
+                itemsToSync--;
+                [self.delegate didChangeSyncingWithItemsToSync:itemsToSync];
+            }
+                            
+            if ([remoteItemsToDownload count] == 0){
+                nextItemToDownload = nil;
+                break;
+            }
+            
+            nextItemToDownload = [remoteItemsToDownload objectAtIndex:0];
+        }
+        
+        if (nextItemToDownload){
+            if (nextItemToDownload.hasThumbnail && _syncThumbnailsOnly){
+                NSLog(@"Downloading Thumbnail: %@", nextItemToDownload.path);
+                [DBClient loadThumbnail:nextItemToDownload.path ofSize:_thumbnailsSize intoPath:nextItemToDownload.localPath];
+                return;
+            } else {
+                NSLog(@"Downloading File: %@", nextItemToDownload.path);
+                [DBClient loadFile:nextItemToDownload.path intoPath:nextItemToDownload.localPath];
+                return;
+            }
         }
     }
     
-    for (DeebeeItem *item in folders){
-        NSLog(@"Creating Folder at Path: %@", item.localPath);
-        NSError *error = nil;
-        NSDictionary *attr = [NSDictionary dictionaryWithObject:item.lastModified forKey:NSFileModificationDate];
-        if(![[NSFileManager defaultManager] createDirectoryAtPath:[NSMutableString stringWithString:item.localPath]
-                                      withIntermediateDirectories:NO attributes:attr error:&error])
-            NSLog(@"ERROR — Creating Folder: %@, %@", error, [error userInfo]);
-    }
-    int oopo = 0;
-    
-    for (DeebeeItem *item in files){
-        oopo++;
-        [operationsQueue addOperationWithBlock:^{
-            if (item.hasThumbnail && _syncThumbnailsOnly){
-                NSLog(@"Downloading Thumbnail: %@", item.path);
-                [client loadThumbnail:item.path ofSize:_thumbnailsSize intoPath:item.localPath];
-            } else {
-                NSLog(@"Downloading File: %@", item.path);
-                [client loadFile:item.path intoPath:item.localPath];
-            }
-        }];
-    }
-    
-    NSLog(@"Times: %i", oopo);
-    NSLog(@"OPERATIONS: %@", operationsQueue.operations);
-    
-    isSyncComplete = [self operationsProgress];
-    
-    if (isSyncComplete){        
+    // TO DO - MUST IMPLEMENT A BETTER WAY TO HANDLE SYNC.
+    // At the moment we only endWithHappiness, and if there are any errors, sync never ends.
+    if (itemsToSync == 0){
         // Since we put files in folders, they'll have a different lastModified date.
         // Hence, update with the ones on Dropbox.
-        for (DeebeeItem *item in folders){
+        for (DeebeeItem *item in foldersToUpdateLocally){
             NSError *error = nil;
             NSDictionary *attr = [NSDictionary dictionaryWithObject:item.lastModified forKey:NSFileModificationDate];
             if (![[NSFileManager defaultManager] setAttributes:attr ofItemAtPath:item.localPath error:&error])
                 NSLog(@"ERROR — Modifying Folder's Modification Date: %@, %@", error, [error userInfo]);
         }
         
-        // There's no last if there's no first, right?
-        // Set things up for the first time.         
+        isMetadataComplete = YES;
+        isSyncComplete = YES;
+        
+        // If there's any folder to sync, we go through and loadMetadata for it.
+        NSMutableArray *remoteFoldersToSync = [NSKeyedUnarchiver unarchiveObjectWithData:[[NSUserDefaults standardUserDefaults] objectForKey:DeebeeRemoteFoldersToSync]];
+        if ([remoteFoldersToSync count] > 0){
+            DeebeeItem *nextFolderToSync = [remoteFoldersToSync objectAtIndex:0];
+            [remoteFoldersToSync removeObject:nextFolderToSync];
+            [[NSUserDefaults standardUserDefaults] setObject:[NSKeyedArchiver archivedDataWithRootObject:remoteFoldersToSync] forKey:DeebeeRemoteFoldersToSync];
+            [[NSUserDefaults standardUserDefaults] synchronize];
+            
+            [DBClient loadMetadata:nextFolderToSync.path];
+            
+            return;
+        }
+        
+        if (isFirstSync){
+            isFirstSync = NO;
+            [[NSUserDefaults standardUserDefaults] setBool:isFirstSync forKey:DeebeeIsFirstSync];
+            [[NSUserDefaults standardUserDefaults] synchronize];
+        }
+        
+        NSLog(@"Sync Complete — Nothing left to sync.");
+        
+        // Update LastLocalItems
         [[NSUserDefaults standardUserDefaults] setObject:[NSKeyedArchiver archivedDataWithRootObject:[self getCurrentPhysicalLocalItems]]
                                                   forKey:DeebeeLastPhysicalLocalItems];
         [[NSUserDefaults standardUserDefaults] setObject:[NSKeyedArchiver archivedDataWithRootObject:[self getCurrentAbstractLocalItems]]
                                                   forKey:DeebeeLastAbstractLocalItems];
         [[NSUserDefaults standardUserDefaults] synchronize];
         
-        // We update the remoteItemsToDownload var after the sync. It'll let us perform some checks.
-         NSArray *remoteItemsLeftToDownload = [NSKeyedUnarchiver unarchiveObjectWithData:[[NSUserDefaults standardUserDefaults] objectForKey:DeebeeRemoteItemsToDownload]];
-        
-        if ([remoteItemsLeftToDownload count] == 0){
-            [self endWithHappiness];
-        } else if ([remoteItemsLeftToDownload count] == initialNumberOfRemoteItemsToDownload){
-            [self endWithFail];
-        } else if ([remoteItemsLeftToDownload count] < initialNumberOfRemoteItemsToDownload){
-            [self endWithPartialHappiness];
-        }
-        
-        return isSyncComplete;
+        [self endWithHappiness];
+        return;
     }
-    
-    return NO;
 }
 
 
-
 #pragma mark ----------------------------------------------------------------------------------------------
-#pragma mark Progress + Useful Local Methods = GOODNESS. Gimme a bear! YES, a BEAR.
+#pragma mark Useful Local Methods = GOODNESS. Gimme a bear! YES, a BEAR.
 #pragma mark ----------------------------------------------------------------------------------------------
-
-- (BOOL)operationsProgress
-{
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [NSTimer timerWithTimeInterval:7 block:^{
-            NSLog(@"Operations Count: %i", operationsQueue.operationCount);
-            [self.delegate didChangeSyncingWithItemsToSync:operationsQueue.operationCount];
-        } repeats:YES];
-    });
-    
-    if (operationsQueue.operationCount == 0)
-        return YES;
-    
-    return NO;
-}
 
 - (NSDictionary *)getAllLocalFoldersAndFiles
 {
@@ -866,168 +915,8 @@
 
 - (void)performSync
 {
-    if (isFirstSync) return;
-    if (!isSyncComplete) return;
-        
-    isSyncComplete = NO;
-    [self.delegate didStartSyncing];
-        
-    NSMutableArray *folders = [NSMutableArray array];
-    NSMutableArray *deletedLocalItems = [NSMutableArray array];
-    NSMutableArray *localItemsToDelete = [NSKeyedUnarchiver unarchiveObjectWithData:[NSMutableArray arrayWithArray:[[NSUserDefaults standardUserDefaults] objectForKey:DeebeeLocalItemsToDelete]]];
-    NSArray *localItemsToUpload = [NSKeyedUnarchiver unarchiveObjectWithData:[[NSUserDefaults standardUserDefaults] objectForKey:DeebeeLocalItemsToUpload]];
-    NSArray *remoteItemsToDelete = [NSKeyedUnarchiver unarchiveObjectWithData:[[NSUserDefaults standardUserDefaults] objectForKey:DeebeeRemoteItemsToDelete]];
-    NSArray *remoteItemsToDownload = [NSKeyedUnarchiver unarchiveObjectWithData:[[NSUserDefaults standardUserDefaults] objectForKey:DeebeeRemoteItemsToDownload]];
-    
-    int initialNumberOfLocalItemsToDelete = [localItemsToDelete count];
-    int initialNumberOfLocalItemsToUpload = [localItemsToUpload count];
-    int initialNumberOfRemoteItemsToDelete = [remoteItemsToDelete count];
-    int initialNumberOfRemoteItemsToDownload = [remoteItemsToDownload count];
-
-    if (initialNumberOfLocalItemsToDelete == 0 && initialNumberOfLocalItemsToUpload == 0 &&
-        initialNumberOfRemoteItemsToDelete == 0 && initialNumberOfRemoteItemsToDownload == 0){
-        NSLog(@"Nothing to sync.");
-        [self endWithHappiness];
-        return;
-    }
-    
-    // We'll need to update NSUserDefaults with the synced items. All the other arrays will be treated
-    // with methods that have a Dropbox callback. In this way, if an item is successfully synced, we
-    // delete it from its array in NSUserDefaults. If not, and hence we got an error, we do nothing
-    // so that we can sync it later, in the next call.
-    // But… localItemsToDelete doesn't use a Dropbox method since it removes items locally.
-    // Therefore we need to work on another solution, that is exploiting the NSError:
-    // if error, do nothing, we retry later; if successfully deleted, we remove the item from the array.
-    
-    if (localItemsToDelete > 0){
-        for (DeebeeItem *item in localItemsToDelete){
-            [operationsQueue addOperationWithBlock:^{
-                NSError *error = nil;
-                NSLog(@"Deleting Local Item: %@", item.path);
-                if(![[NSFileManager defaultManager] removeItemAtPath:item.localPath error:&error]){
-                    if ([self.delegate respondsToSelector:@selector(localItemDeleteFailedWithError:)])
-                        [self.delegate localItemDeleteFailedWithError:error];
-                    NSLog(@"ERROR — Deleting Local Item: %@, %@", error, [error userInfo]);
-                    // We got an error, the item couldn't be deleted either because it's not there
-                    // or because there was another kind of error.
-                    // We do nothing, leave the record in the array, and try to repeat the operation in the next sync.
-                } else {
-                    if ([[NSKeyedUnarchiver unarchiveObjectWithData:[[NSUserDefaults standardUserDefaults] objectForKey:DeebeeLocalItemsToDelete]] containsObject:item])
-                        [deletedLocalItems addObject:item];
-                    // If the item was successfully deleted, we add it to the array that contains the deleted items
-                    // so that we can remove them all later from the original array, localItemsToDelete.
-                }
-            }];
-        }
-        
-        [localItemsToDelete removeObjectsInArray:deletedLocalItems];
-        [[NSUserDefaults standardUserDefaults] setObject:[NSKeyedArchiver archivedDataWithRootObject:localItemsToDelete] forKey:DeebeeLocalItemsToDelete];
-        [[NSUserDefaults standardUserDefaults] synchronize];
-    }
-    
-    if (localItemsToUpload > 0){
-        for (DeebeeItem *item in localItemsToUpload){
-            // Do not upload entire folders, or even their entities only.
-            if (item.isDirectory)
-                continue;
-            
-            [operationsQueue addOperationWithBlock:^{
-                NSLog(@"Uploading File: %@", item.path);
-                [client uploadFile:[NSMutableString stringWithString:item.name]
-                            toPath:[NSMutableString stringWithString:[item.path stringByDeletingLastPathComponent]]
-                     withParentRev:nil
-                          fromPath:[NSMutableString stringWithString:item.localPath]];
-            }];
-        }
-    }
-    
-    if (remoteItemsToDelete > 0){
-        for (DeebeeItem *item in remoteItemsToDelete){
-            [operationsQueue addOperationWithBlock:^{
-                NSLog(@"Deleting Remote Item: %@", item.path);
-                [client deletePath:item.path];
-            }];
-        }
-    }
-    
-    if (remoteItemsToDownload > 0){
-        for (DeebeeItem *item in remoteItemsToDownload){
-            if (item.isDirectory)
-                [folders addObject:item];
-            
-            // Create directory if there's no local counterpart.
-            [operationsQueue addOperationWithBlock:^{
-                if (item.isDirectory){
-                    NSLog(@"Creating Folder at Path: %@", item.localPath);
-                    NSError *error = nil;
-                    NSDictionary *attr = [NSDictionary dictionaryWithObject:item.lastModified forKey:NSFileModificationDate];
-                    if(![[NSFileManager defaultManager] createDirectoryAtPath:[NSMutableString stringWithString:item.localPath]
-                                                  withIntermediateDirectories:NO attributes:attr error:&error])
-                        NSLog(@"ERROR — Creating Folder: %@, %@", error, [error userInfo]);
-                }
-            }];
-            
-            [operationsQueue addOperationWithBlock:^{
-                if (item.hasThumbnail && _syncThumbnailsOnly){
-                    NSLog(@"Downloading Thumbnail: %@", item.path);
-                    [client loadThumbnail:item.path ofSize:_thumbnailsSize intoPath:item.localPath];
-                } else {
-                    NSLog(@"Downloading File: %@", item.path);
-                    [client loadFile:item.path intoPath:item.localPath];
-                }
-            }];
-        }
-    }
-    
-    isSyncComplete = [self operationsProgress];
-    if (isSyncComplete){
-        // Since we put files in folders, they'll have a different lastModified date.
-        // Hence, update the locals with the ones on Dropbox.
-        for (DeebeeItem *item in folders){
-            NSError *error = nil;
-            NSDictionary *attr = [NSDictionary dictionaryWithObject:item.lastModified forKey:NSFileModificationDate];
-            if (![[NSFileManager defaultManager] setAttributes:attr ofItemAtPath:item.localPath error:&error])
-                NSLog(@"ERROR — Modifying Folder's Modification Date: %@, %@", error, [error userInfo]);
-        }
-        
-        // Update LastLocalItems
-        [[NSUserDefaults standardUserDefaults] setObject:[NSKeyedArchiver archivedDataWithRootObject:[self getCurrentPhysicalLocalItems]]
-                                                  forKey:DeebeeLastPhysicalLocalItems];
-        [[NSUserDefaults standardUserDefaults] setObject:[NSKeyedArchiver archivedDataWithRootObject:[self getCurrentAbstractLocalItems]]
-                                                  forKey:DeebeeLastAbstractLocalItems];
-        [[NSUserDefaults standardUserDefaults] synchronize];
-        
-        // We get the updated Defaults to check if there's some items that weren't synced, for one reason or another.
-        // If any, we end the sync differently. If not, endWithHappiness.
-        NSArray *localItemsLeftToDelete = [NSKeyedUnarchiver unarchiveObjectWithData:[[NSUserDefaults standardUserDefaults] objectForKey:DeebeeLocalItemsToDelete]];
-        NSArray *localItemsLeftToUpload = [NSKeyedUnarchiver unarchiveObjectWithData:[[NSUserDefaults standardUserDefaults] objectForKey:DeebeeLocalItemsToUpload]];
-        NSArray *remoteItemsLeftToDelete = [NSKeyedUnarchiver unarchiveObjectWithData:[[NSUserDefaults standardUserDefaults] objectForKey:DeebeeRemoteItemsToDelete]];
-        NSArray *remoteItemsLeftToDownload = [NSKeyedUnarchiver unarchiveObjectWithData:[[NSUserDefaults standardUserDefaults] objectForKey:DeebeeRemoteItemsToDownload]];
-        
-        if ([remoteItemsLeftToDownload count] == 0 && [remoteItemsLeftToDelete count] == 0 &&
-            [localItemsLeftToDelete count] == 0 && [localItemsLeftToUpload count] == 0){
-            [self endWithHappiness];
-        } else if ([remoteItemsLeftToDownload count] == initialNumberOfRemoteItemsToDownload && [remoteItemsLeftToDelete count] && initialNumberOfRemoteItemsToDelete &&
-                     [localItemsLeftToDelete count] == initialNumberOfLocalItemsToDelete && [localItemsLeftToUpload count] == initialNumberOfLocalItemsToUpload){
-                [self endWithFail];
-        } else if ([remoteItemsLeftToDownload count] == initialNumberOfRemoteItemsToDownload || [remoteItemsLeftToDelete count] == initialNumberOfRemoteItemsToDelete ||
-                   [localItemsLeftToDelete count] == initialNumberOfLocalItemsToDelete || [localItemsLeftToUpload count] == initialNumberOfLocalItemsToUpload){
-            [self endWithPartialHappiness];
-        } else if ([remoteItemsLeftToDownload count] < initialNumberOfRemoteItemsToDownload || [remoteItemsLeftToDelete count] < initialNumberOfRemoteItemsToDelete ||
-                   [localItemsLeftToDelete count] < initialNumberOfLocalItemsToDelete || [localItemsLeftToUpload count] < initialNumberOfLocalItemsToUpload){
-            [self endWithPartialHappiness];
-        } else {
-            // Temp.
-            NSLog(@"END WITH FORCE, something went wrong."),
-            [self endWithForce];
-        }
-    }
-}
-
-- (void)performLoadMetadata
-{
     [self.delegate didStartLoadingMetadata];
-    [client loadMetadata:_remoteRootPath];
+    [DBClient loadMetadata:_remoteRootPath];
 }
 
 // Erases all local files and folders but not those on Dropbox.

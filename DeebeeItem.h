@@ -1,9 +1,14 @@
 //
 //  DeebeeItem.h
-//  Forma
+//  v 0.3 ß
 //
-//  Created by Will Flagello on 12/5/12.
-//  Copyright (c) 2012 Will Flagello. All rights reserved.
+//  Created by Will Flagello. MIT License.
+//  ----------------------------------------------------------------------------------------------------
+//  Special thanks to Chris Hulbert and his CHBgDropboxSync.
+//
+//  github.com/flvgello/deebee
+//
+//  For Dropbox iOS SDK 1.3
 //
 
 #import <Foundation/Foundation.h>

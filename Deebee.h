@@ -1,12 +1,14 @@
 //
 //  Deebee.h
-//  v 1.0
+//  v 0.3 ß
 //
-//  Created by Will Flagello, licensed with Evey License.
+//  Created by Will Flagello. MIT License.
 //  ----------------------------------------------------------------------------------------------------
 //  Special thanks to Chris Hulbert and his CHBgDropboxSync.
 //
 //  github.com/flvgello/deebee
+//
+//  For Dropbox iOS SDK 1.3
 //
 
 #import <Foundation/Foundation.h>
@@ -32,7 +34,6 @@
 
 - (void)initWithSync;
 - (void)performSync;
-- (void)performLoadMetadata;
 - (void)unlinkDropboxAndEraseAllLocalData;
 
 @end
