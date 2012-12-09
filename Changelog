@@ -1,2 +1,0 @@
-0.1.1
-- Fixed a bug with _escapeRootFiles: NO file would have been downloaded if YES.
